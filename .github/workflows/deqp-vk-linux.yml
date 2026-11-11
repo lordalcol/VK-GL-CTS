@@ -1,0 +1,76 @@
+# Builds deqp-vk for Linux x86_64 (vulkan_headless target, no display needed)
+# and packages it with its data and the vk-default mustpass.
+# Experiment for public issue 260; based on the approach of PR 616.
+
+name: deqp-vk Linux x86_64
+
+on:
+  push:
+    tags:
+      - 'vulkan-cts-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: write   # only needed to attach the package to a release
+    env:
+      PKG: deqp-vk-linux-x86_64-${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zstd
+          cmake --version
+          df -h .
+
+      - name: Fetch external sources
+        run: python3 external/fetch_sources.py
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DDEQP_TARGET=vulkan_headless
+
+      - name: Build deqp-vk
+        run: |
+          cmake --build build --target deqp-vk
+          df -h .
+
+      - name: Package
+        run: |
+          VK=build/external/vulkancts/modules/vulkan
+          mkdir -p "$PKG"
+          cp "$VK/deqp-vk" "$PKG/"
+          strip "$PKG/deqp-vk"
+          cp -r "$VK/vulkan" "$PKG/"
+          cp -r "$VK/vk-default" "$PKG/"
+          cp external/vulkancts/mustpass/main/vk-default.txt "$PKG/"
+          git rev-parse HEAD > "$PKG/COMMIT"
+          tar --zstd -cf "$PKG.tar.zst" "$PKG"
+          ls -la "$PKG.tar.zst"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.tar.zst
+          archive: false
+          retention-days: 7
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: ${{ env.PKG }}.tar.zst
