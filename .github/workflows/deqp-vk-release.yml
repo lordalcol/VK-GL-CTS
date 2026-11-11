@@ -1,0 +1,186 @@
+# Builds deqp-vk for Linux x86_64 and Windows x64 from a commit that is about
+# to be tagged, and puts both packages in a draft release for the planned tag.
+# Run it before pushing the release tag; after pushing the tag, publish the
+# draft. See the job summary for the steps.
+
+name: deqp-vk release binaries
+run-name: deqp-vk binaries for ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full SHA of the commit that will be tagged
+        required: true
+      tag:
+        description: Planned release tag, for example vulkan-cts-1.4.7.2
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check inputs
+        env:
+          COMMIT: ${{ inputs.commit }}
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "commit must be a full 40 character SHA"; exit 1; }
+          [[ "$TAG" =~ ^vulkan-cts-[A-Za-z0-9.-]+$ ]] || { echo "tag must start with vulkan-cts-"; exit 1; }
+          gh api "repos/$REPO/commits/$COMMIT" --jq .sha
+          # An existing tag must already point at the commit.
+          peeled=$(git ls-remote "https://github.com/$REPO.git" "refs/tags/$TAG^{}" | cut -f1)
+          plain=$(git ls-remote "https://github.com/$REPO.git" "refs/tags/$TAG" | cut -f1)
+          target=${peeled:-$plain}
+          if [ -n "$target" ] && [ "$target" != "$COMMIT" ]; then
+            echo "tag $TAG exists and points at $target, not $COMMIT"; exit 1
+          fi
+          # Never touch a published release.
+          published=$(gh api "repos/$REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\" and .draft == false) | .id")
+          [ -z "$published" ] || { echo "release $TAG is already published"; exit 1; }
+
+  linux:
+    needs: check
+    runs-on: ubuntu-22.04   # glibc 2.35: the binary also runs on Ubuntu 22.04, Debian 12 and newer
+    timeout-minutes: 300
+    env:
+      PKG: deqp-vk-linux-x86_64-${{ inputs.tag }}
+      TAG: ${{ inputs.tag }}
+      CC: gcc-12
+      CXX: g++-12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 1
+
+      - name: Name the release
+        # deqp-vk reports `git describe` as its release name; a local annotated
+        # tag makes it the planned tag, as in a build of the pushed tag.
+        run: |
+          git -c user.name=ci -c user.email=ci@localhost tag -a "$TAG" -m "$TAG"
+          git describe --always --long --abbrev=40
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zstd
+          $CXX --version | head -1
+
+      - name: Fetch external sources
+        run: python3 external/fetch_sources.py
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGET=vulkan_headless
+
+      - name: Build deqp-vk
+        run: cmake --build build --target deqp-vk
+
+      - name: Package
+        run: |
+          VK=build/external/vulkancts/modules/vulkan
+          mkdir -p "$PKG"
+          cp "$VK/deqp-vk" "$PKG/"
+          strip "$PKG/deqp-vk"
+          cp -r "$VK/vulkan" "$VK/vk-default" "$PKG/"
+          cp external/vulkancts/mustpass/main/vk-default.txt "$PKG/"
+          git rev-parse HEAD > "$PKG/COMMIT"
+          objdump -T "$PKG/deqp-vk" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1
+          tar --zstd -cf "$PKG.tar.zst" "$PKG"
+          ls -la "$PKG.tar.zst"
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux
+          path: ${{ env.PKG }}.tar.zst
+          retention-days: 30
+
+  windows:
+    needs: check
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      PKG: deqp-vk-windows-x64-${{ inputs.tag }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 1
+
+      - name: Name the release
+        run: |
+          git -c user.name=ci -c user.email=ci@localhost tag -a "$env:TAG" -m "$env:TAG"
+          git describe --always --long --abbrev=40
+
+      - name: Fetch external sources
+        run: python external/fetch_sources.py
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build deqp-vk
+        run: cmake --build build --config Release --target deqp-vk --parallel 4
+
+      - name: Package
+        run: |
+          $vk = "build/external/vulkancts/modules/vulkan"
+          New-Item -ItemType Directory $env:PKG | Out-Null
+          Copy-Item "$vk/Release/deqp-vk.exe" $env:PKG
+          Copy-Item -Recurse "$vk/vulkan" $env:PKG
+          Copy-Item -Recurse "$vk/vk-default" $env:PKG
+          Copy-Item external/vulkancts/mustpass/main/vk-default.txt $env:PKG
+          git rev-parse HEAD | Out-File -Encoding ascii "$env:PKG/COMMIT"
+          7z a -tzip -mx=7 "$env:PKG.zip" $env:PKG | Out-Null
+          Get-Item "$env:PKG.zip"
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: ${{ env.PKG }}.zip
+          retention-days: 30
+
+  draft-release:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      COMMIT: ${{ inputs.commit }}
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: pkgs
+          merge-multiple: true
+
+      - name: Create or update the draft release
+        run: |
+          ls -la pkgs
+          # A draft from an earlier run of this workflow is replaced.
+          for id in $(gh api "repos/$REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | .id"); do
+            gh api -X DELETE "repos/$REPO/releases/$id"
+          done
+          gh release create "$TAG" pkgs/* --repo "$REPO" --draft --target "$COMMIT" --title "$TAG" --notes ""
+          {
+            echo "## Draft release $TAG is ready"
+            echo
+            echo "Built from $COMMIT."
+            echo
+            echo "1. Push the annotated tag $TAG (pointing at $COMMIT)."
+            echo "2. Open the draft on the Releases page and click Publish."
+            echo
+            echo "Push the tag first: if the tag does not exist, Publish creates a lightweight tag on $COMMIT instead."
+          } >> "$GITHUB_STEP_SUMMARY"
