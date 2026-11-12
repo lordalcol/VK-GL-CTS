@@ -1,6 +1,6 @@
 # Builds deqp-vk for Windows x64 with the Visual Studio 2022 generator and MSVC,
-# as a Visual Studio user does, and packages it with its data and the
-# vk-default mustpass. Experiment for public issue 260.
+# as a Visual Studio user does, with the static MSVC runtime, and packages it
+# with its data and the vk-default mustpass. Experiment for public issue 260.
 
 name: deqp-vk Windows x64
 
@@ -32,13 +32,27 @@ jobs:
           python --version
           python external/fetch_sources.py
 
+      # Static MSVC runtime, so the package runs without the VC++ redistributable.
+      # static-crt.cmake brings the fetched shaderc onto it too.
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: |
+          $hook = "$PWD/.github/static-crt.cmake" -replace '\\', '/'
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            "-DCMAKE_PROJECT_INCLUDE=$hook"
 
       - name: Build deqp-vk
         run: |
           cmake --build build --config Release --target deqp-vk --parallel 4
           Get-PSDrive -PSProvider FileSystem
+
+      - name: Check deqp-vk needs no VC++ runtime DLLs
+        run: |
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin /dependents build/external/vulkancts/modules/vulkan/Release/deqp-vk.exe | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          $deps
+          $crt = $deps | Where-Object { $_ -match '^(msvcp|vcruntime|concrt)\d+|^ucrtbase' }
+          if ($crt) { throw "deqp-vk.exe links the VC++ runtime DLLs: $($crt -join ', ')" }
 
       - name: Package
         run: |
